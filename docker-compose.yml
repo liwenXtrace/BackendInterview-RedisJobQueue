@@ -1,0 +1,59 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fastapi-api
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      QUEUE_KEY: jobs:queue
+      PROCESSING_KEY: jobs:processing
+      PROCESSING_TIMEOUT_S: "3"
+      MAX_ATTEMPTS: "2"
+      WORKER_CONCURRENCY: "1"
+      WORKER_POLL_BLOCK_S: "5"
+
+      # IMPORTANT: API should NOT start workers in this setup.
+      START_WORKERS_IN_API: "false"
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000","--log-level", "info",
+          "--access-log"]
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: job-worker
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      QUEUE_KEY: jobs:queue
+      PROCESSING_KEY: jobs:processing
+      PROCESSING_TIMEOUT_S: "3"
+      MAX_ATTEMPTS: "2"
+      WORKER_CONCURRENCY: "2"   # you can bump this
+      WORKER_POLL_BLOCK_S: "5"
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: [
+        "python",
+        "-c",
+        "import asyncio; from app.worker import start_workers; asyncio.run(start_workers())"
+      ]
