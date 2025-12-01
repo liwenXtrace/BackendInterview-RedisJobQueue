@@ -144,3 +144,130 @@ At minimum, include two pytest tests:
 
         - attempts becomes 2 (forced retry)
 
+
+
+
+## Redis Hints (for this challenge)
+
+You may use any correct Redis strategy. Below are hints and common patterns that can help.
+
+### 1) Redis stores strings
+Redis values are bytes/strings/numbers.  
+If you need to store JSON (payloads/results), serialize it:
+
+```python
+import json
+await redis.hset(key, "payload", json.dumps(payload))
+payload = json.loads(await redis.hget(key, "payload"))
+````
+
+Avoid writing Python `None` directly — use `""` or `"null"`.
+
+---
+
+### 2) A reliable queue pattern using Redis Lists
+
+A common approach is a **queue list** plus a **processing list**:
+
+* **Queue list**: waiting jobs
+* **Processing list**: jobs claimed by workers but not yet ack’d
+
+Workers can claim jobs **atomically** with:
+
+```
+BRPOPLPUSH <queue_list> <processing_list>
+```
+
+This single Redis command:
+
+* blocks until a job exists
+* removes a job from the queue
+* inserts it into processing
+* all atomically, so jobs aren’t lost if a worker crashes.
+
+After finishing, workers **ack** by removing from processing:
+
+```
+LREM <processing_list> 1 <job_id>
+```
+
+---
+
+### 3) Redis Streams are also valid
+
+Instead of lists, you **may** use Streams:
+
+* enqueue with `XADD`
+* workers consume with `XREADGROUP`
+* on success: `XACK`
+* reclaim stuck jobs from the pending list (`XPENDING`, `XAUTOCLAIM`, etc.)
+
+Streams naturally support multi-worker concurrency.
+
+---
+
+### 4) Track job state in a Redis Hash
+
+Most designs store job metadata in a hash, e.g.:
+
+```
+HSET job:<id> status queued payload "<json>" attempts 0 ...
+```
+
+Useful fields:
+
+* `status`: queued | processing | done | failed
+* `payload`: JSON string
+* `result`: JSON string or null
+* `attempts`: how many times claimed
+* `started_at`: when processing began (used to detect stuck jobs)
+* `last_error`: failure info (optional)
+
+---
+
+### 5) Timeouts / stuck jobs
+
+To requeue stuck jobs, you need a way to tell how long a job has been processing.
+
+Typical approach:
+
+* when a worker marks processing, set `started_at = now`
+* a “reaper” loop scans processing jobs
+* if `now - started_at > PROCESSING_TIMEOUT_S`:
+
+  * and attempts < MAX_ATTEMPTS → requeue once
+  * else → fail terminally
+
+How you scan depends on your Redis structure:
+
+* Lists: `LRANGE processing 0 -1`
+* Streams: inspect pending entries
+
+---
+
+### 6) Atomicity matters under concurrency
+
+Be careful with “check then act” across multiple Redis calls.
+
+Example of a race-prone pattern:
+
+```python
+count = await redis.llen(queue)
+if count > 0:
+    job = await redis.rpop(queue)   # race here
+```
+
+Prefer atomic primitives (`BRPOPLPUSH`, Streams consumer groups) or Lua scripts if needed.
+
+---
+
+### 7) Make cleanup decisions explicit
+
+Old completed jobs can accumulate. It’s okay to:
+
+* keep terminal jobs forever (simpler)
+* OR set a TTL after done/failed (more production-like)
+
+Just document your choice.
+
+---
